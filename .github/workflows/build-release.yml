@@ -22,6 +22,7 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       tag: ${{ steps.ver.outputs.tag }}
+      version: ${{ steps.ver.outputs.version }}
     steps:
       - name: Validate tag and derive version string
         id: ver
@@ -29,14 +30,17 @@ jobs:
           INPUT_TAG: ${{ inputs.tag }}
         run: |
           set -euo pipefail
-          # Strip leading v; the Dockerfile stamps -X main.Version=v${VERSION} itself.
           TAG="${INPUT_TAG#v}"
           # Only [A-Za-z0-9._-] — defense in depth before any shell/registry use.
           if ! printf '%s' "$TAG" | grep -qE '^[A-Za-z0-9._-]+$'; then
             echo "Refusing to use unsafe tag value: $TAG" >&2
             exit 1
           fi
+          # TAG: image + release tag (leading v stripped for consistency).
+          # VERSION: stamped into the binary via the Dockerfile's build-arg,
+          # which itself prepends v (-X main.Version=v${VERSION}).
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "version=$TAG" >> "$GITHUB_OUTPUT"
 
   build:
     name: Build (${{ matrix.arch }})

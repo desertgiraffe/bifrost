@@ -143,7 +143,8 @@ func acceptsMaxEffort(model string) bool {
 	return strings.Contains(modelLower, "gpt-5.6") ||
 		strings.Contains(modelLower, "gpt-6") ||
 		strings.Contains(modelLower, "deepseek-v4") ||
-		strings.Contains(modelLower, "glm-5.2")
+		strings.Contains(modelLower, "glm-5.2") ||
+		strings.Contains(modelLower, "glm-5.3-flash")
 }
 
 // bareModelLower strips any provider prefix and lowercases, so the effort

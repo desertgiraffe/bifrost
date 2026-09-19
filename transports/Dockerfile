@@ -28,12 +28,16 @@
   ENV CGO_ENABLED=1 GOOS=linux
 
   COPY transports/go.mod transports/go.sum ./
-  RUN ls
-  RUN cat go.mod
+
+  # Local core (go.mod replace => ../core): includes the GLM-5.3-Flash max-effort fix
+  COPY core/go.mod core/go.sum /core/
   RUN go mod download
 
   # Copy source code and dependencies
   COPY transports/ ./
+
+  # Full local core source (layer-cached separately from its go.mod)
+  COPY core/ /core/
 
   COPY --from=ui-builder /app/out ./bifrost-http/ui
 

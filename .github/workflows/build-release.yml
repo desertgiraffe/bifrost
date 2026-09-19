@@ -7,65 +7,174 @@ on:
         description: 'Release tag (e.g. v2.2.1-baseline or v2.2.1-glm53fix)'
         required: true
 
+# Least-privilege default: read-only at the top level; jobs that push to GHCR
+# or create releases grant write themselves.
 permissions:
-  contents: write
-  packages: write
+  contents: read
 
 env:
   REGISTRY: ghcr.io
   IMAGE_NAME: ${{ github.repository }}
 
 jobs:
-  build:
+  prepare:
+    name: Validate inputs
     runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.ver.outputs.tag }}
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
+      - name: Validate tag and derive version string
+        id: ver
+        env:
+          INPUT_TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          # Strip leading v; the Dockerfile stamps -X main.Version=v${VERSION} itself.
+          TAG="${INPUT_TAG#v}"
+          # Only [A-Za-z0-9._-] — defense in depth before any shell/registry use.
+          if ! printf '%s' "$TAG" | grep -qE '^[A-Za-z0-9._-]+$'; then
+            echo "Refusing to use unsafe tag value: $TAG" >&2
+            exit 1
+          fi
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
 
-      - name: Set up QEMU (arm64)
-        uses: docker/setup-qemu-action@v3
+  build:
+    name: Build (${{ matrix.arch }})
+    needs: prepare
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      fail-fast: false
+      matrix:
+        # Native runners per arch — no QEMU emulation (emulated CGO/Go builds
+        # are 5-20x slower than native).
+        include:
+          - arch: amd64
+            platform: linux/amd64
+            runner: ubuntu-24.04
+          - arch: arm64
+            platform: linux/arm64
+            runner: ubuntu-24.04-arm
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@v4
 
       - name: Log in to GHCR
-        uses: docker/login-action@v3
+        uses: docker/login-action@v4
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Derive version string (strip leading v)
-        id: ver
-        run: echo "version=$(echo '${{ inputs.tag }}' | sed 's/^v//')" >> "$GITHUB_OUTPUT"
-
-      - name: Build and push multi-arch image
-        uses: docker/build-push-action@v6
+      - name: Build and push platform image by digest
+        id: build
+        uses: docker/build-push-action@v7
         with:
           context: .
           file: transports/Dockerfile
-          platforms: linux/amd64,linux/arm64
-          push: true
-          build-args: VERSION=${{ steps.ver.outputs.version }}
-          tags: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ inputs.tag }}
+          platforms: ${{ matrix.platform }}
+          outputs: type=image,push-by-digest=true,name-canonical=true,push=true
+          tags: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          build-args: VERSION=${{ needs.prepare.outputs.tag }}
+          cache-from: type=gha,scope=build-${{ matrix.arch }}
+          cache-to: type=gha,scope=build-${{ matrix.arch }},mode=max
+
+      - name: Export digest
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/digests
+          touch "/tmp/digests/${DIGEST#sha256:}"
+
+      - name: Upload digests
+        uses: actions/upload-artifact@v7
+        with:
+          name: digests-${{ matrix.arch }}
+          path: /tmp/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  release:
+    name: Merge manifest and publish release
+    needs: [prepare, build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      packages: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v4
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Download digests
+        uses: actions/download-artifact@v8
+        with:
+          pattern: digests-*
+          path: /tmp/digests
+          merge-multiple: true
+
+      - name: Create multi-arch manifest
+        env:
+          TAG: ${{ needs.prepare.outputs.tag }}
+        run: |
+          set -euo pipefail
+          image="${REGISTRY}/${IMAGE_NAME}"
+          refs=()
+          while IFS= read -r digest_file; do
+            refs+=("${image}@sha256:$(basename "$digest_file")")
+          done < <(find /tmp/digests -type f | sort)
+          if [ "${#refs[@]}" -eq 0 ]; then
+            echo "No image digests found" >&2
+            exit 1
+          fi
+          docker buildx imagetools create -t "${image}:${TAG}" "${refs[@]}"
+          docker buildx imagetools inspect "${image}:${TAG}"
 
       - name: Extract static binary from image
+        env:
+          TAG: ${{ needs.prepare.outputs.tag }}
         run: |
-          cid=$(docker create --platform linux/amd64 "${REGISTRY}/${IMAGE_NAME}:${{ inputs.tag }}")
+          set -euo pipefail
+          image="${REGISTRY}/${IMAGE_NAME}:${TAG}"
+          cid=$(docker create --platform linux/amd64 "$image")
           docker cp "$cid":/app/main ./bifrost-http-linux-amd64
           docker rm "$cid"
           chmod +x ./bifrost-http-linux-amd64
-          ./bifrost-http-linux-amd64 --version 2>/dev/null || true
 
-      - name: Create release with binary
+      - name: Create or update release with binary
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ needs.prepare.outputs.tag }}
         run: |
-          gh release create "${{ inputs.tag }}" ./bifrost-http-linux-amd64 \
-            --title "${{ inputs.tag }}" \
-            --target "${{ github.sha }}" \
-            --notes "Automated build of \`${{ github.ref_name }}\` (commit ${{ github.sha }}).
+          set -euo pipefail
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" ./bifrost-http-linux-amd64 --clobber
+          else
+            gh release create "$TAG" ./bifrost-http-linux-amd64 \
+              --title "$TAG" \
+              --target "${{ github.sha }}" \
+              --notes "Automated build of \`${{ github.ref_name }}\` (commit ${{ github.sha }}).
 
-          - Docker image: \`ghcr.io/${{ github.repository }}:${{ inputs.tag }}\` (linux/amd64, linux/arm64)
+          - Docker image: \`ghcr.io/${{ github.repository }}:${TAG}\` (linux/amd64, linux/arm64)
           - Binary: statically linked bifrost-http (linux/amd64, sqlite_static)
           - Source branch: ${{ github.ref_name }}"
+          fi
